@@ -1,0 +1,16 @@
+{
+  "name": "rdp-verifier",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.cjs",
+  "description": "Verify responsive RDP authentication handshakes from local target lists",
+  "repository": "https://github.com/mohammadgld/rdp-verifier",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "package:win": "node scripts/package-win.mjs"
+  },
+  "devDependencies": {
+    "electron": "45.3.2"
+  }
+}
