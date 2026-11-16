@@ -1,5 +1,8 @@
 import { probeRdp } from './rdp.mjs';
 import { setMaxListeners } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const CONFIRMATION_GAP_MS = 250;
 
 function category(reason) {
   if (reason === 'timeout') return 'timeout';
@@ -41,7 +44,17 @@ export function createScan(targets, { concurrency = 32, timeoutMs = 3000, probe 
       const target = targets[index];
       let completed = false;
       try {
-        const result = await probe(target.host, target.port, { timeoutMs, signal: controller.signal });
+        let result = await probe(target.host, target.port, { timeoutMs, signal: controller.signal });
+        if (!controller.signal.aborted && result.ok) {
+          try {
+            await delay(CONFIRMATION_GAP_MS, undefined, { signal: controller.signal });
+          } catch {
+            // A stop request aborts the pause between independent probes.
+          }
+          if (!controller.signal.aborted) {
+            result = await probe(target.host, target.port, { timeoutMs, signal: controller.signal });
+          }
+        }
         if (!controller.signal.aborted && result.ok) {
           scan.matches.push(target);
           scan.stats.verified += 1;

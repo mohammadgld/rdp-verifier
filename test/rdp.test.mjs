@@ -18,13 +18,38 @@ function der(tag, content) {
   return Buffer.concat([Buffer.from([tag]), length, content]);
 }
 
-function challenge() {
-  const ntlm = Buffer.alloc(48);
+function challenge({ errorCode = false, badTargetInfoOffset = false, badTokenTail = false, spnegoState, shortVersion = false } = {}) {
+  const ntlm = Buffer.alloc(shortVersion ? 48 : 60);
   ntlm.write('NTLMSSP\0', 0, 'ascii');
   ntlm.writeUInt32LE(2, 8);
-  const token = der(0xa0, der(0x04, ntlm));
+  ntlm.writeUInt32LE(shortVersion ? 0x02000201 : 0x00800201, 20); // Unicode, NTLM, target information or version.
+  Buffer.from('0102030405060708', 'hex').copy(ntlm, 24);
+  if (!shortVersion) {
+    ntlm.writeUInt16LE(4, 40);
+    ntlm.writeUInt16LE(4, 42);
+    ntlm.writeUInt32LE(badTargetInfoOffset ? 1000 : 56, 44);
+  }
+  // The target information payload is a terminating MsvAvEOL pair.
+  const tokenBytes = spnegoState !== undefined
+    ? der(0xa1, der(0x30, Buffer.concat([
+      der(0xa0, der(0x0a, Buffer.from([spnegoState]))),
+      der(0xa2, der(0x04, ntlm)),
+    ])))
+    : badTokenTail
+      ? der(0x30, Buffer.concat([der(0x04, ntlm), Buffer.from([0xff])]))
+      : ntlm;
+  const token = der(0xa0, der(0x04, tokenBytes));
   const nego = der(0xa1, der(0x30, der(0x30, token)));
-  return der(0x30, Buffer.concat([der(0xa0, der(0x02, Buffer.from([6]))), nego]));
+  const fields = [der(0xa0, der(0x02, Buffer.from([6]))), nego];
+  if (errorCode) fields.push(der(0xa4, der(0x02, Buffer.from([5]))));
+  return der(0x30, Buffer.concat(fields));
+}
+
+function errorResponse() {
+  return der(0x30, Buffer.concat([
+    der(0xa0, der(0x02, Buffer.from([6]))),
+    der(0xa4, der(0x02, Buffer.from([5]))),
+  ]));
 }
 
 async function localServer(onRequest) {
@@ -60,6 +85,72 @@ test('challenge parser requires a full CredSSP NTLM challenge', () => {
   const falseMessage = Buffer.from(message);
   falseMessage.writeUInt32LE(1, falseMessage.indexOf('NTLMSSP') + 8);
   assert.equal(parseCredsspChallenge(falseMessage), false);
+});
+
+test('challenge parser rejects a CredSSP errorCode even alongside a Type 2 token', () => {
+  assert.equal(parseCredsspChallenge(challenge({ errorCode: true })), false);
+  assert.equal(parseCredsspChallenge(Buffer.concat([challenge(), errorResponse()])), false);
+});
+
+test('challenge parser rejects malformed NTLM security buffer offsets', () => {
+  assert.equal(parseCredsspChallenge(challenge({ badTargetInfoOffset: true })), false);
+});
+
+test('challenge parser rejects a malformed SPNEGO token after a Type 2 payload', () => {
+  assert.equal(parseCredsspChallenge(challenge({ badTokenTail: true })), false);
+});
+
+test('challenge parser rejects SPNEGO negState reject despite a valid Type 2 responseToken', () => {
+  assert.equal(parseCredsspChallenge(challenge({ spnegoState: 2 })), false);
+  assert.equal(parseCredsspChallenge(challenge({ spnegoState: 1 })), true);
+});
+
+test('challenge parser rejects a truncated NTLM Version field when NEGOTIATE_VERSION is set', () => {
+  assert.equal(parseCredsspChallenge(challenge({ shortVersion: true })), false);
+});
+
+test('probe rejects a server that closes immediately after its challenge', async () => {
+  const secureContext = tls.createSecureContext({
+    key: await readFile(fixture('key.pem')),
+    cert: await readFile(fixture('cert.pem')),
+  });
+  const server = await localServer((socket) => {
+    socket.write(NLA_CONFIRM, () => {
+      const secured = new tls.TLSSocket(socket, { isServer: true, secureContext });
+      secured.once('data', () => {
+        secured.write(challenge(), () => setTimeout(() => secured.end(), 20));
+      });
+      secured.on('error', () => {});
+    });
+  });
+  try {
+    const result = await probeRdp('127.0.0.1', server.port, { timeoutMs: 1000 });
+    assert.equal(result.ok, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test('probe rejects a server error sent right after a challenge', async () => {
+  const secureContext = tls.createSecureContext({
+    key: await readFile(fixture('key.pem')),
+    cert: await readFile(fixture('cert.pem')),
+  });
+  const server = await localServer((socket) => {
+    socket.write(NLA_CONFIRM, () => {
+      const secured = new tls.TLSSocket(socket, { isServer: true, secureContext });
+      secured.once('data', () => {
+        secured.write(challenge(), () => setTimeout(() => secured.write(errorResponse()), 20));
+      });
+      secured.on('error', () => {});
+    });
+  });
+  try {
+    const result = await probeRdp('127.0.0.1', server.port, { timeoutMs: 1000 });
+    assert.equal(result.ok, false);
+  } finally {
+    await server.close();
+  }
 });
 
 test('probe keeps a real RDP/CredSSP challenge and handles fragmented replies', async () => {

@@ -2,7 +2,7 @@
 
 RDP Verifier یک ابزار ویندوزی با رابط کوچک است که فهرست IP و پورت را بررسی می‌کند و پس از پایان، فقط مقصدهای تأییدشده را در یک فایل متنی روی دسکتاپ می‌نویسد.
 
-RDP Verifier is a portable Windows desktop app for checking whether an IPv4 endpoint responds as an RDP service and reaches an NLA/CredSSP authentication challenge quickly. It shows a progress bar and counts; the completed result list is written to a TXT file on the Desktop.
+RDP Verifier is a portable Windows desktop app for checking whether an IPv4 endpoint repeatedly responds as an RDP service and reaches an NLA/CredSSP authentication challenge quickly. It shows a progress bar and counts; the completed result list is written to a TXT file on the Desktop.
 
 ![RDP Verifier scanning window](docs/preview.png)
 
@@ -48,24 +48,24 @@ ip,port
 
 ## What “verified” means
 
-Each target receives one end-to-end deadline of **3 seconds**, beginning with its TCP connection attempt. A target appears in the final file only if all of these stages complete within that deadline:
+Each target receives an initial credential-free probe. If it passes, the app waits **250 ms** and performs a second, independent probe. **Both** must pass. Each probe has its own end-to-end deadline of **3 seconds**, beginning with its TCP connection attempt. A probe passes only if all of these stages complete within its deadline:
 
 1. A TCP connection opens to the specified port.
 2. The server returns a valid RDP X.224 negotiation confirmation selecting CredSSP/NLA (`HYBRID` or `HYBRID_EX`).
 3. A TLS handshake completes.
-4. After a credential-free CredSSP/NTLM Type 1 negotiation message, the server returns a CredSSP NTLM Type 2 authentication challenge.
+4. After a credential-free CredSSP/NTLM Type 1 negotiation message, the server returns a CredSSP response with a structurally valid NTLM Type 2 authentication challenge and no CredSSP error code. The TLS connection must then remain open without an error for a **300 ms observation period**; that period is part of the probe's 3-second deadline.
 
-A merely open port, unrelated service, incomplete packet, stalled connection, failed TLS exchange, or missing authentication challenge is excluded. The app sends **no username or password** and does not attempt to sign in.
+A merely open port, unrelated service, incomplete or malformed packet, stalled connection, failed TLS exchange, CredSSP error response, missing authentication challenge, or one-time transient response is excluded. The app sends **no username or password** and does not attempt to sign in.
 
-This is a protocol-level check for a responsive RDP authentication path. It cannot prove that a graphical login window would appear in a particular RDP client, that credentials would be accepted, or that a desktop session would work. A service that emulates this protocol exchange could pass. Conversely, a working service can be omitted if it uses an unsupported older RDP security mode, a Kerberos-only path, or takes longer than 3 seconds. TLS certificate identity is not validated; this accommodates common self-signed RDP certificates but does not authenticate the server's identity.
+This is a protocol-level check for a repeatably responsive RDP authentication path. Requiring two independent successful probes reduces transient and connection-stage false positives. It cannot prove that a graphical login window would appear in a particular RDP client, that credentials would be accepted, or that a desktop session would work. A service that emulates both protocol exchanges could still pass. Conversely, a working service can be omitted if it uses an unsupported older RDP security mode, a Kerberos-only path, or either probe takes longer than 3 seconds. TLS certificate identity is not validated; this accommodates common self-signed RDP certificates but does not authenticate the server's identity.
 
 ## Concurrency and progress
 
 The **Concurrent checks** setting controls the maximum number of asynchronous network probes in flight, not the number of operating-system threads. The scanner starts up to the smaller of the selected value and the number of targets.
 
 - **Total** is the count after range expansion and `IP:port` deduplication.
-- **Checked** increases only after a target has finished with a verified or rejected outcome.
-- **Verified** counts targets that passed every protocol stage above.
+- **Checked** increases once per target, after its first failure or after both successful probes. A passing first probe alone does not increase the verified count.
+- **Verified** counts targets that passed both independent protocol exchanges.
 - The displayed percentage is `checked / total`, rounded to one decimal place. It stays below 100% until all targets finish.
 - **Stop** aborts in-flight probes and stops scheduling new ones. Aborted probes are not counted as checked, so partial progress can remain below 100%.
 
@@ -113,6 +113,6 @@ The package command writes `dist/RDP-Verifier-Windows.zip`. It uses the Electron
 | --- | --- |
 | File does not load | Use a readable, nonempty UTF-8 text file. The filename appears after loading; target syntax is checked when the scan starts. |
 | Invalid input or target limit | Read the line-numbered error; check IPv4 format, port range, CIDR size, and the 1,000,000-target cap. |
-| 0 verified | No target completed the required RDP/NLA/TLS/CredSSP exchange within 3 seconds. This alone does not prove every host is offline. |
+| 0 verified | No target passed both required RDP/NLA/TLS/CredSSP exchanges, each within its own 3-second deadline. This alone does not prove every host is offline. |
 | Scan stops below 100% | Stop cancels remaining work and does not save a final file. |
 | No Desktop file after completion | Check the status message for a save error and verify that the scan reached **Scan complete**, not **Scan stopped**. |

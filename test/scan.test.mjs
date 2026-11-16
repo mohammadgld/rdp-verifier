@@ -46,16 +46,25 @@ test('cancel stops new targets and releases in-flight probes', async () => {
 
 test('results already displayed during a scan keep their order at completion', async () => {
   const targets = [1, 2].map((port) => ({ host: '127.0.0.1', port }));
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let firstCalls = 0;
   const scan = createScan(targets, {
     concurrency: 2,
     timeoutMs: 1000,
     probe: async (_host, port) => {
-      await new Promise((resolve) => setTimeout(resolve, port === 1 ? 40 : 5));
+      if (port === 1 && ++firstCalls === 2) await firstGate;
       return { ok: true };
     },
   });
-  await new Promise((resolve) => setTimeout(resolve, 15));
-  assert.deepEqual(scan.matches, [targets[1]]);
+  try {
+    for (let attempt = 0; attempt < 100 && scan.matches.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(scan.matches, [targets[1]]);
+  } finally {
+    releaseFirst();
+  }
   await scan.done;
   assert.deepEqual(scan.matches, [targets[1], targets[0]]);
 });
@@ -108,4 +117,21 @@ test('supports 3000 concurrent checks and counts completed targets exactly', asy
   assert.equal(scan.matches.length, 3);
   assert.equal(scan.stats.verified, 3);
   assert.equal(Object.values(scan.stats).reduce((sum, count) => sum + count, 0), scan.scanned);
+});
+
+test('a transient first authentication challenge is not a verified result', async () => {
+  let calls = 0;
+  const scan = createScan([{ host: '127.0.0.1', port: 3389 }], {
+    concurrency: 1,
+    timeoutMs: 1000,
+    probe: async () => (++calls === 1
+      ? { ok: true, reason: 'credssp-challenge' }
+      : { ok: false, reason: 'closed' }),
+  });
+  await scan.done;
+  assert.equal(calls, 2);
+  assert.equal(scan.scanned, 1);
+  assert.equal(scan.stats.verified, 0);
+  assert.equal(scan.stats.connectionError, 1);
+  assert.deepEqual(scan.matches, []);
 });

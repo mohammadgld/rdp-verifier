@@ -16,6 +16,7 @@ const CREDSSP_NEGOTIATE = Buffer.from(
 const NTLM_SIGNATURE = Buffer.from('NTLMSSP\0', 'ascii');
 const MAX_TPKT = 512;
 const MAX_CREDSSP = 16_384;
+const CHALLENGE_OBSERVATION_MS = 300;
 
 export function parseNegotiationConfirm(frame) {
   if (!Buffer.isBuffer(frame) || frame.length < 19 || frame[0] !== 3 || frame[1] !== 0) return null;
@@ -50,21 +51,144 @@ function readDerElement(bytes, offset, limit) {
   return { tag, valueStart, end: valueStart + length };
 }
 
+function ntlmToken(bytes, depth = 0) {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(NTLM_SIGNATURE)) return bytes;
+  if (depth >= 8 || bytes.length < 2) return null;
+  const container = readDerElement(bytes, 0, bytes.length);
+  if (!container || container.end !== bytes.length || !(container.tag & 0x20)) return null;
+  let offset = container.valueStart;
+  let found = null;
+  let rejected = false;
+  while (offset < container.end) {
+    const child = readDerElement(bytes, offset, container.end);
+    if (!child || child.end > container.end) return null;
+    if (container.tag === 0x30 && child.tag === 0xa0) {
+      const state = readDerElement(bytes, child.valueStart, child.end);
+      if (state?.tag === 0x0a && state.end === child.end) {
+        if (state.end - state.valueStart !== 1) return null;
+        rejected ||= bytes[state.valueStart] === 2; // SPNEGO negState=reject.
+      }
+    }
+    if (child.tag === 0x04 || (child.tag & 0x20)) {
+      const nested = child.tag === 0x04
+        ? bytes.subarray(child.valueStart, child.end)
+        : bytes.subarray(offset, child.end);
+      const candidate = ntlmToken(nested, depth + 1);
+      if (candidate) {
+        if (found) return null;
+        found = candidate;
+      }
+    }
+    offset = child.end;
+  }
+  return rejected ? null : found;
+}
+
+function securityBuffer(bytes, offset, minimumPayloadOffset) {
+  if (offset + 8 > bytes.length) return null;
+  const length = bytes.readUInt16LE(offset);
+  const maximum = bytes.readUInt16LE(offset + 2);
+  const position = bytes.readUInt32LE(offset + 4);
+  if (length > maximum) return null;
+  if (length === 0) return { start: 0, end: 0, length: 0 };
+  if (position < minimumPayloadOffset || position + length > bytes.length) return null;
+  return { start: position, end: position + length, length };
+}
+
+function validTargetInfo(bytes) {
+  if (!bytes.length) return true;
+  let offset = 0;
+  while (offset + 4 <= bytes.length) {
+    const id = bytes.readUInt16LE(offset);
+    const length = bytes.readUInt16LE(offset + 2);
+    offset += 4;
+    if (offset + length > bytes.length) return false;
+    if (id === 0) return length === 0 && offset === bytes.length;
+    offset += length;
+  }
+  return false;
+}
+
+function validNtlmChallenge(bytes) {
+  if (!bytes || bytes.length < 48 || !bytes.subarray(0, 8).equals(NTLM_SIGNATURE)) return false;
+  if (bytes.readUInt32LE(8) !== 2) return false;
+  const flags = bytes.readUInt32LE(20);
+  if (!(flags & 0x00000200) || !(flags & 0x00000003)) return false;
+  if ((flags & 0x02000000) && bytes.length < 56) return false;
+  if (bytes.subarray(24, 32).every((byte) => byte === 0)) return false;
+  if (bytes.subarray(32, 40).some((byte) => byte !== 0)) return false;
+  const minimumPayloadOffset = flags & 0x02000000 ? 56 : 48;
+  const targetName = securityBuffer(bytes, 12, minimumPayloadOffset);
+  const targetInfo = securityBuffer(bytes, 40, minimumPayloadOffset);
+  if (!targetName || !targetInfo) return false;
+  if ((flags & 0x00000001) && targetName.length % 2 !== 0) return false;
+  if (targetInfo.length && !(flags & 0x00800000)) return false;
+  return validTargetInfo(bytes.subarray(targetInfo.start, targetInfo.end));
+}
+
+function validNegoData(bytes, field) {
+  const sequence = readDerElement(bytes, field.valueStart, field.end);
+  if (!sequence || sequence.tag !== 0x30 || sequence.end !== field.end) return false;
+  let offset = sequence.valueStart;
+  let foundChallenge = false;
+  while (offset < sequence.end) {
+    const item = readDerElement(bytes, offset, sequence.end);
+    if (!item || item.tag !== 0x30 || item.end > sequence.end) return false;
+    const tokenField = readDerElement(bytes, item.valueStart, item.end);
+    if (!tokenField || tokenField.tag !== 0xa0 || tokenField.end !== item.end) return false;
+    const octet = readDerElement(bytes, tokenField.valueStart, tokenField.end);
+    if (!octet || octet.tag !== 0x04 || octet.end !== tokenField.end) return false;
+    if (!validNtlmChallenge(ntlmToken(bytes.subarray(octet.valueStart, octet.end)))) return false;
+    foundChallenge = true;
+    offset = item.end;
+  }
+  return foundChallenge;
+}
+
+function validTsRequest(bytes, outer) {
+  const versionField = readDerElement(bytes, outer.valueStart, outer.end);
+  if (!versionField || versionField.tag !== 0xa0 || versionField.end > outer.end) return false;
+  const version = readDerElement(bytes, versionField.valueStart, versionField.end);
+  if (!version || version.tag !== 0x02 || version.end !== versionField.end) return false;
+  const versionLength = version.end - version.valueStart;
+  if (versionLength < 1 || versionLength > 4 || (bytes[version.valueStart] & 0x80)) return false;
+  let versionNumber = 0;
+  for (let offset = version.valueStart; offset < version.end; offset += 1) {
+    versionNumber = versionNumber * 256 + bytes[offset];
+  }
+  if (versionNumber < 2) return false;
+
+  let offset = versionField.end;
+  let hasChallenge = false;
+  while (offset < outer.end) {
+    const field = readDerElement(bytes, offset, outer.end);
+    if (!field || field.end > outer.end) return false;
+    if (field.tag === 0xa4) return false; // An errorCode requires an RDP client to fail.
+    if (field.tag !== 0xa1 || hasChallenge || !validNegoData(bytes, field)) return false;
+    hasChallenge = true;
+    offset = field.end;
+  }
+  return hasChallenge;
+}
+
 export function parseCredsspChallenge(bytes) {
   if (!Buffer.isBuffer(bytes)) return false;
-  if (bytes.length < 2) return null;
-  if (bytes[0] !== 0x30) return false;
-  if ((bytes[1] === 0x81 && bytes.length < 3) || (bytes[1] === 0x82 && bytes.length < 4)) return null;
-  const outer = readDerElement(bytes, 0, bytes.length);
-  if (!outer || outer.end > MAX_CREDSSP) return false;
-  if (outer.end > bytes.length) return null;
-  const version = readDerElement(bytes, outer.valueStart, outer.end);
-  if (!version || version.tag !== 0xa0 || version.end > outer.end) return false;
-  const negotiation = readDerElement(bytes, version.end, outer.end);
-  if (!negotiation || negotiation.tag !== 0xa1 || negotiation.end > outer.end) return false;
-  const signature = bytes.indexOf(NTLM_SIGNATURE, negotiation.valueStart);
-  if (signature < negotiation.valueStart || signature + 48 > negotiation.end) return false;
-  return bytes.readUInt32LE(signature + 8) === 2;
+  if (bytes.length === 0) return null;
+  let offset = 0;
+  let hasChallenge = false;
+  while (offset < bytes.length) {
+    if (bytes[offset] !== 0x30) return false;
+    if (offset + 2 > bytes.length) return null;
+    if ((bytes[offset + 1] === 0x81 && offset + 3 > bytes.length)
+      || (bytes[offset + 1] === 0x82 && offset + 4 > bytes.length)) return null;
+    const outer = readDerElement(bytes, offset, bytes.length);
+    if (!outer || outer.end - offset > MAX_CREDSSP) return false;
+    if (outer.end > bytes.length) return null;
+    if (!validTsRequest(bytes, outer)) return false;
+    hasChallenge = true;
+    offset = outer.end;
+  }
+  return hasChallenge;
 }
 
 export function probeRdp(host, port, { timeoutMs = 3000, signal } = {}) {
@@ -76,10 +200,12 @@ export function probeRdp(host, port, { timeoutMs = 3000, signal } = {}) {
     let stage = 'confirm';
     let data = Buffer.alloc(0);
     let done = false;
+    let observationTimer;
     const finish = (ok, reason) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      clearTimeout(observationTimer);
       signal?.removeEventListener('abort', onAbort);
       secured?.destroy();
       socket.destroy();
@@ -108,12 +234,18 @@ export function probeRdp(host, port, { timeoutMs = 3000, signal } = {}) {
         secured.write(CREDSSP_NEGOTIATE);
       });
       secured.on('data', (part) => {
-        if (done || stage !== 'challenge') return;
+        if (done || (stage !== 'challenge' && stage !== 'observing')) return;
         data = Buffer.concat([data, part]);
         if (data.length > MAX_CREDSSP) return finish(false, 'oversized-challenge');
         const outcome = parseCredsspChallenge(data);
-        if (outcome === true) finish(true, 'credssp-challenge');
-        else if (outcome === false) finish(false, 'invalid-challenge');
+        if (outcome === false) return finish(false, 'invalid-challenge');
+        if (outcome === true && stage === 'challenge') {
+          stage = 'observing';
+          observationTimer = setTimeout(() => {
+            if (parseCredsspChallenge(data) === true) finish(true, 'credssp-challenge');
+            else finish(false, 'invalid-challenge');
+          }, CHALLENGE_OBSERVATION_MS);
+        }
       });
       secured.on('error', () => finish(false, 'tls-error'));
       secured.on('close', () => finish(false, 'closed'));
